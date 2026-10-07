@@ -1,24 +1,57 @@
 /*
- * png2ico.c - build a multi-resolution Windows .ico file from one PNG.
+ * png2ico.c - build a multi-resolution Windows .ico file from PNG images.
  *
  * A Windows icon file holds several copies of the same picture at
  * different pixel sizes (16x16, 32x32, ... 256x256). Windows picks the
- * copy that best matches the size it needs to draw. This program reads a
- * single source PNG, produces a scaled copy for each requested size, and
- * packs them all into one .ico file.
+ * copy that best matches the size it needs to draw. This program reads one
+ * or more source PNGs, produces a copy of the picture at each requested
+ * size, and packs them all into one .ico file.
  *
  * Dependencies: libpng 1.6.29 or later (libpng license) and zlib (zlib
  * license), which libpng itself requires. 1.6.29 is the first release with
  * png_image_write_to_memory(), used below.
  *
- * Build:
- *     cc -O2 -o png2ico png2ico.c $(pkg-config --cflags --libs libpng) -lm
+ * Build, with libpng and zlib linked statically (macOS and Linux):
+ *     L=$(pkg-config --variable=libdir libpng)
+ *     cc -O2 -o png2ico png2ico.c $(pkg-config --cflags libpng) \
+ *         "$L/libpng16.a" "$L/libz.a" -lm
+ *
+ *   The archives are named by path because Apple's linker always prefers a
+ *   .dylib over a .a in the same directory. This assumes zlib's archive is
+ *   in the same directory as libpng's.
  *
  * Usage:
- *     png2ico out.ico in.png [size ...]
+ *     png2ico -o OUTPUT [-favicon] INPUT...
  *
- *     Each size is a square edge length in pixels, from 1 to 256.
- *     If no sizes are given, the default is 16 24 32 48 64 128 256.
+ *     -o OUTPUT    The .ico file to write.
+ *     -favicon     Include only sizes 16, 32 and 48, for a website's
+ *                  favicon.ico.
+ *     INPUT        A source PNG file. At least one is required.
+ *
+ *     Options and inputs may appear in any order. Without -favicon, every
+ *     size in standard_sizes[] below up to 256 is included: 16, 24, 32, 48,
+ *     64, 128 and 256.
+ *
+ * Which input is used for each size:
+ *   - An input can be assigned to one size in either of two ways:
+ *       * by a size prefix: "16:small.png" is assigned to size 16;
+ *       * by its name: if the file name, without its extension, ends in a
+ *         possible size, it is assigned to that size. "icon16.png",
+ *         "icon_16.png" and "icon_16x16.png" are all assigned to size 16.
+ *     The size must be one of possible_sizes[] below. A prefix takes
+ *     precedence over the name. Two inputs may not be assigned to the same
+ *     size. If an assigned input is not exactly that size, it is scaled to
+ *     fit and a warning is printed. An assigned size is added to the
+ *     output if an .ico can hold it, with or without -favicon; this is the
+ *     only way to produce a size that is not a standard size.
+ *   - Every other size is made from the input whose picture is closest to
+ *     that size without being smaller, so that it is scaled down as little
+ *     as possible. If every input is smaller than that size, the largest
+ *     input is scaled up. All inputs are candidates, including assigned
+ *     ones. For example, given a 1024-pixel and a 65-pixel input, sizes 64
+ *     and below are made from the 65-pixel input and larger sizes from the
+ *     1024-pixel input.
+ *   - An input's size, for this purpose, is its longer side.
  *
  * How each size is produced:
  *   - The source keeps its aspect ratio. A non-square source is scaled to
@@ -26,36 +59,364 @@
  *     short sides (letterboxing).
  *   - Shrinking uses an area-averaging ("box") filter: each output pixel is
  *     the average of every source pixel it covers, weighted by how much of
- *     each source pixel falls inside it. This is the standard way to shrink
- *     an image without aliasing.
- *   - Enlarging (only when the source is smaller than a requested size)
- *     uses bilinear interpolation: each output pixel blends the four
- *     nearest source pixels. Box filtering would just repeat pixels and
- *     look blocky.
+ *     each source pixel falls inside it.
+ *   - Enlarging (only when no source is at least as large as the requested
+ *     size) uses bilinear interpolation: each output pixel blends the four
+ *     nearest source pixels.
  *   - Both filters average colors weighted by alpha ("premultiplied
  *     alpha"). Without that, the invisible color stored in fully
  *     transparent pixels, often black, would bleed into the visible edge
  *     of the icon and leave a dark fringe.
  *
  * How the icons are stored:
- *   Sizes below 256 are stored as uncompressed bitmaps, the original icon
- *   format, which every version of Windows can read, including XP.
- *   The 256 size is stored as a complete PNG file instead. An
- *   uncompressed 256x256 bitmap would add about 270 KB, and only Windows
- *   Vista and later use 256-pixel icons; those versions also read PNG
- *   entries. Windows XP does not use the 256-pixel entry.
+ *   Sizes below 256 are stored as uncompressed bitmaps, which Windows XP
+ *   can read. The 256 size is stored as a complete PNG file, which
+ *   requires Windows Vista or later.
+ *
+ * Exit status:
+ *   0 on success. On failure, a message is printed and the program exits
+ *   with the negative of the relevant errno value:
+ *     -EINVAL  invalid command line, or an input that is not a valid PNG;
+ *     -ENOMEM  out of memory, or an input too large to load;
+ *     -errno   from a failed file operation, or -EIO if the operation
+ *              failed without setting errno.
+ *   The shell sees this value modulo 256; for example, -EINVAL (-22) is
+ *   reported as 234.
+ *
+ * Output:
+ *   The .ico is written to a temporary file in the same directory, named
+ *   OUTPUT.PID.N, and then renamed to OUTPUT, so that OUTPUT is never left
+ *   partly written. If anything fails, the temporary file is deleted and
+ *   any existing OUTPUT is left unchanged.
+ *
+ * Structure:
+ *   main() runs four steps in order, each in its own function:
+ *     1. parse_command_line() fills in a struct options, which records only
+ *        what the command line asked for.
+ *     2. read_sources() fills in a struct image_set: it decodes the inputs,
+ *        picks the input for each size, and scales it, producing a plain
+ *        RGBA image for each size.
+ *     3. write_ico() encodes those images and writes the .ico file.
+ *     4. cleanup() frees the image set.
+ *   The images from step 2 are not specific to the .ico format.
+ *
+ *   Errors are handled where they occur: the message is printed and the
+ *   program exits immediately. Memory still allocated at that point is
+ *   released by the operating system.
  */
-#include <png.h>
+#define _POSIX_C_SOURCE 200809L     /* open(), getpid(), fdopen() */
+
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <png.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-/* Print an error message and exit. Used for every unrecoverable error. */
-static void die(const char *msg)
+/*
+ * Every size, in pixels, that can be produced or assigned to an input,
+ * smallest first: the sizes Windows 11 draws icons at, plus those of a
+ * macOS .icns. Sizes above 256 are not used in .ico files but are
+ * accepted as input sizes and kept for other icon formats.
+ *
+ * Many arrays below have one element per entry in this table, called a
+ * "slot". Slot i holds information about size possible_sizes[i].
+ */
+static const int possible_sizes[] = {
+    16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 128, 256, 512, 1024
+};
+enum { NUM_SIZES = sizeof possible_sizes / sizeof *possible_sizes };
+
+/*
+ * The sizes produced automatically, when -favicon is not given: Windows'
+ * minimum set (16, 24, 32, 48, 256) plus a typical macOS .icns (16, 32,
+ * 64, 128, 256, 512, 1024). An .ico gets those up to 256. Other possible
+ * sizes are produced only when an input is assigned to them.
+ */
+static const int standard_sizes[] = { 16, 24, 32, 48, 64, 128, 256, 512, 1024 };
+
+/* The sizes produced when -favicon is given. */
+static const int favicon_sizes[] = { 16, 32, 48 };
+
+/* The largest size an .ico file can hold. */
+enum { ICO_MAX_SIZE = 256 };
+
+/* One input file named on the command line. */
+struct input {
+    const char *path;       /* file name, without any "SIZE:" prefix */
+    int slot;               /* slot it is assigned to, or -1 if none */
+};
+
+/* What the command line asked for. Filled in by parse_command_line(). */
+struct options {
+    const char *output;             /* the file to write */
+    struct input *inputs;           /* every input, in command-line order */
+    int num_inputs;
+    bool target[NUM_SIZES];         /* true for each size to produce */
+};
+
+/* An RGBA image: 4 bytes per pixel (red, green, blue, alpha), rows packed
+ * with no gaps between them. */
+struct image {
+    int width;
+    int height;
+    unsigned char *rgba;
+};
+
+/*
+ * The pixels the program works with. Filled in by read_sources().
+ *
+ * All the icons share one allocation, icon_block. Each target slot's icon
+ * is a square of possible_sizes[slot] pixels on a side, and icon[slot] points to
+ * where it starts inside the block. Slots that are not targets have no
+ * icon, and their icon[] entry is NULL.
+ */
+struct image_set {
+    struct image *input;            /* decoded inputs, in the same order
+                                       as options.inputs */
+    int source[NUM_SIZES];          /* for each target slot, the index of
+                                       the input its icon is made from */
+    unsigned char *icon_block;
+    unsigned char *icon[NUM_SIZES];
+};
+
+/*
+ * Return the slot for a size in pixels, or -1 if it is not a possible
+ * size.
+ */
+static int slot_for_size(long size)
 {
-    fprintf(stderr, "png2ico: %s\n", msg);
-    exit(1);
+    for (int i = 0; i < NUM_SIZES; i++)
+        if (possible_sizes[i] == size)
+            return i;
+    return -1;
+}
+
+/*
+ * Return the slot a file name assigns its file to, or -1 if none.
+ *
+ * Takes the last component of the path (after any '/' or '\'), removes the
+ * extension (from the last '.'), and looks at the digits at the end of
+ * what remains. If there are 1 to 4 of them and they form a possible size,
+ * that is the size. "art/icon_16x16.png" gives 16; "logo2023.png" gives
+ * none, since 2023 is not a possible size.
+ */
+static int slot_from_name(const char *path)
+{
+    const char *base = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\')
+            base = p + 1;
+
+    const char *end = strrchr(base, '.');
+    if (!end)
+        end = base + strlen(base);
+
+    const char *digits = end;
+    while (digits > base && digits[-1] >= '0' && digits[-1] <= '9')
+        digits--;
+    if (end - digits < 1 || end - digits > 4)
+        return -1;
+
+    int size = 0;
+    for (const char *p = digits; p < end; p++)
+        size = size * 10 + (*p - '0');
+    return slot_for_size(size);
+}
+
+/* Print a short description of how to run the program. */
+static void print_usage(void)
+{
+    fputs("Usage: png2ico -o OUTPUT [-favicon] INPUT...\n"
+          "\n"
+          "  -o OUTPUT  The .ico file to write.\n"
+          "  -favicon   Include only sizes 16, 32 and 48, for a website favicon.\n"
+          "  INPUT      A source PNG. Prefix it with a size (16:small.png), or end\n"
+          "             its name with one (icon16.png), to use it for that size.\n",
+          stderr);
+}
+
+/*
+ * Step 1: read the command line into opt. See the top of this file for
+ * the command-line syntax.
+ *
+ * The arguments are read by hand rather than with getopt(), because
+ * getopt() only supports single-letter options and would read -favicon as
+ * the seven options -f, -a, -v, -i, -c, -o and -n.
+ */
+static void parse_command_line(struct options *opt, int argc, char **argv)
+{
+    bool favicon = false;
+
+    memset(opt, 0, sizeof *opt);
+
+    /*
+     * Make room for the inputs. There can be no more of them than there
+     * are arguments, so allocate that many and count the real ones below.
+     */
+    opt->inputs = calloc((size_t)argc, sizeof *opt->inputs);
+    if (!opt->inputs) {
+        fprintf(stderr, "png2ico: Out of memory.\n");
+        exit(-ENOMEM);
+    }
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+
+        /* Any argument beginning with '-' is an option. */
+        if (arg[0] == '-') {
+            if (strcmp(arg, "-o") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "png2ico: The -o option needs a file name.\n");
+                    print_usage();
+                    exit(-EINVAL);
+                }
+                if (opt->output) {
+                    fprintf(stderr, "png2ico: The -o option was given more than once.\n");
+                    exit(-EINVAL);
+                }
+                opt->output = argv[++i];
+            } else if (strcmp(arg, "-favicon") == 0) {
+                favicon = true;
+            } else {
+                fprintf(stderr, "png2ico: Unknown option \"%s\".\n", arg);
+                print_usage();
+                exit(-EINVAL);
+            }
+            continue;
+        }
+
+        /* Anything else is an input file. */
+        struct input *in = &opt->inputs[opt->num_inputs++];
+
+        /*
+         * A size prefix is one or more digits followed by ':', as in
+         * "16:small.png". Without one, the file name may still assign the
+         * input to a size.
+         */
+        size_t ndigits = strspn(arg, "0123456789");
+        if (ndigits > 0 && arg[ndigits] == ':') {
+            in->slot = ndigits <= 4 ? slot_for_size(strtol(arg, NULL, 10)) : -1;
+            in->path = arg + ndigits + 1;
+            if (in->slot < 0) {
+                fprintf(stderr, "png2ico: In \"%s\", %.*s is not a possible "
+                        "icon size. Valid sizes are", arg, (int)ndigits, arg);
+                for (int j = 0; j < NUM_SIZES; j++)
+                    fprintf(stderr, "%s %d", j ? "," : "", possible_sizes[j]);
+                fputs(".\n", stderr);
+                exit(-EINVAL);
+            }
+            if (*in->path == '\0') {
+                fprintf(stderr, "png2ico: \"%s\" has a size but no file name.\n",
+                        arg);
+                exit(-EINVAL);
+            }
+        } else {
+            in->path = arg;
+            in->slot = slot_from_name(arg);
+        }
+
+        /* No two inputs may be assigned to the same size. */
+        if (in->slot >= 0) {
+            for (int j = 0; j < opt->num_inputs - 1; j++) {
+                if (opt->inputs[j].slot == in->slot) {
+                    fprintf(stderr, "png2ico: \"%s\" and \"%s\" are both "
+                            "assigned to size %d.\n", opt->inputs[j].path,
+                            in->path, possible_sizes[in->slot]);
+                    exit(-EINVAL);
+                }
+            }
+        }
+    }
+
+    if (!opt->output) {
+        fprintf(stderr, "png2ico: No output file was given. Use -o FILE.\n");
+        print_usage();
+        exit(-EINVAL);
+    }
+    if (opt->num_inputs == 0) {
+        fprintf(stderr, "png2ico: No input files were given.\n");
+        print_usage();
+        exit(-EINVAL);
+    }
+
+    /*
+     * Choose the sizes to produce: the favicon sizes or the standard sizes
+     * an .ico can hold, plus every size an input is assigned to, if an .ico
+     * can hold it.
+     */
+    if (favicon) {
+        for (size_t i = 0; i < sizeof favicon_sizes / sizeof *favicon_sizes; i++)
+            opt->target[slot_for_size(favicon_sizes[i])] = true;
+    } else {
+        for (size_t i = 0; i < sizeof standard_sizes / sizeof *standard_sizes; i++)
+            if (standard_sizes[i] <= ICO_MAX_SIZE)
+                opt->target[slot_for_size(standard_sizes[i])] = true;
+    }
+    for (int i = 0; i < opt->num_inputs; i++) {
+        int slot = opt->inputs[i].slot;
+        if (slot >= 0 && possible_sizes[slot] <= ICO_MAX_SIZE)
+            opt->target[slot] = true;
+    }
+}
+
+/*
+ * Read a PNG file into img as 8-bit RGBA.
+ *
+ * Uses libpng's "simplified" API. png_image_begin_read_from_stdio() reads
+ * the header, which gives the width and height. We then ask for 8-bit RGBA
+ * output, whatever the file's actual format (palette, grayscale, 16-bit,
+ * etc.), and png_image_finish_read() decodes the pixels into our buffer,
+ * converting them as needed.
+ */
+static void read_png(struct image *img, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        int err = errno ? errno : EIO;
+        fprintf(stderr, "png2ico: Cannot open \"%s\": %s.\n", path, strerror(err));
+        exit(-err);
+    }
+
+    png_image png;
+    memset(&png, 0, sizeof png);
+    png.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_stdio(&png, f)) {
+        fprintf(stderr, "png2ico: Cannot read \"%s\": %s.\n", path, png.message);
+        exit(-EINVAL);
+    }
+
+    /*
+     * The buffer needs width * height * 4 bytes. Refuse an image for which
+     * that product would not fit in a size_t (possible on 32-bit systems)
+     * or whose dimensions would not fit in an int, rather than allocate a
+     * buffer that is too small.
+     */
+    if (png.width > INT32_MAX || png.height > INT32_MAX ||
+        png.width > SIZE_MAX / 4 / png.height) {
+        fprintf(stderr, "png2ico: \"%s\" is too large to load (%lux%lu pixels).\n",
+                path, (unsigned long)png.width, (unsigned long)png.height);
+        exit(-ENOMEM);
+    }
+
+    png.format = PNG_FORMAT_RGBA;
+    img->rgba = malloc((size_t)png.width * png.height * 4);
+    if (!img->rgba) {
+        fprintf(stderr, "png2ico: Out of memory.\n");
+        exit(-ENOMEM);
+    }
+    if (!png_image_finish_read(&png, NULL, img->rgba, 0, NULL)) {
+        fprintf(stderr, "png2ico: Cannot read \"%s\": %s.\n", path, png.message);
+        exit(-EINVAL);
+    }
+    fclose(f);
+
+    img->width = (int)png.width;
+    img->height = (int)png.height;
 }
 
 /*
@@ -274,16 +635,13 @@ static void scale_bilinear(const unsigned char *src, int sw, int sh,
 }
 
 /*
- * Produce one icon image: an s x s RGBA buffer containing the source
- * scaled to fit, centered, with transparent padding around it. The caller
- * frees the result.
+ * Draw src into an s x s RGBA icon at dst, scaled to fit and centered.
+ * dst must already be zero-filled (fully transparent), since only the area
+ * the picture covers is written; the rest is left as transparent padding.
  */
-static unsigned char *render(const unsigned char *src, int sw, int sh, int s)
+static void render(unsigned char *dst, int s, const struct image *src)
 {
-    /* calloc zero-fills, so the padding starts out fully transparent. */
-    unsigned char *canvas = calloc((size_t)s * s, 4);
-    if (!canvas)
-        die("out of memory");
+    int sw = src->width, sh = src->height;
 
     /*
      * Work out how big the picture should be inside the icon, without
@@ -304,10 +662,10 @@ static unsigned char *render(const unsigned char *src, int sw, int sh, int s)
     /*
      * Center the picture in the icon by leaving equal transparent margins
      * on opposite sides. In the example above, the margins are 64 pixels
-     * at the top and 64 at the bottom. dst is the location in the canvas
+     * at the top and 64 at the bottom. corner is the location in the icon
      * where the picture's top-left pixel goes.
      */
-    unsigned char *dst = canvas + ((size_t)((s - dh) / 2) * s + (s - dw) / 2) * 4;
+    unsigned char *corner = dst + ((size_t)((s - dh) / 2) * s + (s - dw) / 2) * 4;
 
     /*
      * Pick the filter: bilinear if the picture is being made larger than
@@ -316,38 +674,110 @@ static unsigned char *render(const unsigned char *src, int sw, int sh, int s)
      * always grow or shrink together.
      */
     if (dw > sw || dh > sh)
-        scale_bilinear(src, sw, sh, dst, s, dw, dh);
+        scale_bilinear(src->rgba, sw, sh, corner, s, dw, dh);
     else
-        scale_box(src, sw, sh, dst, s, dw, dh);
-    return canvas;
+        scale_box(src->rgba, sw, sh, corner, s, dw, dh);
+}
+
+/* An image's size for choosing between inputs: its longer side. */
+static int longer_side(const struct image *img)
+{
+    return img->width > img->height ? img->width : img->height;
 }
 
 /*
- * Compress a w x h RGBA image into a PNG file held in memory. Returns a
- * malloc'd buffer and stores its length in *len. The caller frees it.
- *
- * libpng's write-to-memory call is made twice: the first call, with a
- * NULL buffer, only reports how many bytes the PNG needs; the second
- * call writes it.
+ * Choose the input each target size is made from, and record its index in
+ * set->source[]. See the top of this file for the rules.
  */
-static unsigned char *encode_png(const unsigned char *rgba, int w, int h,
-                                 png_alloc_size_t *len)
+static void choose_sources(const struct options *opt, struct image_set *set)
 {
-    png_image img;
-    memset(&img, 0, sizeof img);
-    img.version = PNG_IMAGE_VERSION;
-    img.width = (png_uint_32)w;
-    img.height = (png_uint_32)h;
-    img.format = PNG_FORMAT_RGBA;
+    bool chosen[NUM_SIZES] = { false };
 
-    if (!png_image_write_to_memory(&img, NULL, len, 0, rgba, 0, NULL))
-        die(img.message);
-    unsigned char *buf = malloc(*len);
-    if (!buf)
-        die("out of memory");
-    if (!png_image_write_to_memory(&img, buf, len, 0, rgba, 0, NULL))
-        die(img.message);
-    return buf;
+    /* First, every input assigned to a size is used for that size. */
+    for (int i = 0; i < opt->num_inputs; i++) {
+        int slot = opt->inputs[i].slot;
+        if (slot < 0 || !opt->target[slot])
+            continue;
+
+        const struct image *img = &set->input[i];
+        int s = possible_sizes[slot];
+        if (img->width != s || img->height != s)
+            fprintf(stderr, "png2ico: Warning: \"%s\" is %dx%d, not %dx%d. "
+                    "It will be scaled to fit.\n", opt->inputs[i].path,
+                    img->width, img->height, s, s);
+        set->source[slot] = i;
+        chosen[slot] = true;
+    }
+
+    /*
+     * Every other size uses the smallest input that is at least that
+     * size, or, if there is none, the largest input. When two inputs are
+     * the same size, the one given first on the command line is used.
+     */
+    for (int slot = 0; slot < NUM_SIZES; slot++) {
+        if (!opt->target[slot] || chosen[slot])
+            continue;
+
+        int s = possible_sizes[slot];
+        int smallest_fit = -1;      /* index of the smallest input >= s */
+        int largest = 0;            /* index of the largest input of all */
+
+        for (int i = 0; i < opt->num_inputs; i++) {
+            int size = longer_side(&set->input[i]);
+
+            if (size >= s && (smallest_fit < 0 ||
+                              size < longer_side(&set->input[smallest_fit])))
+                smallest_fit = i;
+            if (size > longer_side(&set->input[largest]))
+                largest = i;
+        }
+        set->source[slot] = smallest_fit >= 0 ? smallest_fit : largest;
+    }
+}
+
+/*
+ * Step 2: decode every input, choose the input for each size to be
+ * produced, and scale it to that size, filling in set.
+ */
+static void read_sources(const struct options *opt, struct image_set *set)
+{
+    memset(set, 0, sizeof *set);
+
+    set->input = calloc((size_t)opt->num_inputs, sizeof *set->input);
+    if (!set->input) {
+        fprintf(stderr, "png2ico: Out of memory.\n");
+        exit(-ENOMEM);
+    }
+    for (int i = 0; i < opt->num_inputs; i++)
+        read_png(&set->input[i], opt->inputs[i].path);
+
+    choose_sources(opt, set);
+
+    /*
+     * Allocate one zero-filled block for all the icons, then lay them out
+     * in it one after another, smallest first. Zero-filled means fully
+     * transparent, which render() relies on for the padding.
+     */
+    size_t block_size = 0;
+    for (int slot = 0; slot < NUM_SIZES; slot++)
+        if (opt->target[slot])
+            block_size += (size_t)possible_sizes[slot] * possible_sizes[slot] * 4;
+
+    set->icon_block = calloc(block_size, 1);
+    if (!set->icon_block) {
+        fprintf(stderr, "png2ico: Out of memory.\n");
+        exit(-ENOMEM);
+    }
+
+    unsigned char *next = set->icon_block;
+    for (int slot = 0; slot < NUM_SIZES; slot++) {
+        if (!opt->target[slot])
+            continue;
+        int s = possible_sizes[slot];
+        set->icon[slot] = next;
+        render(next, s, &set->input[set->source[slot]]);
+        next += (size_t)s * s * 4;
+    }
 }
 
 /*
@@ -355,73 +785,82 @@ static unsigned char *encode_png(const unsigned char *rgba, int w, int h,
  * significant byte first). These write a 16- or 32-bit value that way,
  * regardless of the byte order of the machine running this program.
  */
-static void put16(unsigned char *p, unsigned v)
+static void put16(unsigned char *p, uint16_t v)
 {
-    p[0] = v & 0xFF;
-    p[1] = (v >> 8) & 0xFF;
+    p[0] = (unsigned char)(v & 0xFF);
+    p[1] = (unsigned char)(v >> 8);
 }
 
-static void put32(unsigned char *p, unsigned long v)
+static void put32(unsigned char *p, uint32_t v)
 {
-    put16(p, v & 0xFFFF);
-    put16(p + 2, (v >> 16) & 0xFFFF);
+    put16(p, (uint16_t)(v & 0xFFFF));
+    put16(p + 2, (uint16_t)(v >> 16));
+}
+
+/* Sizes of the fixed-length structures in an .ico file, in bytes. */
+enum {
+    ICONDIR_SIZE = 6,           /* the file header */
+    ICONDIRENTRY_SIZE = 16,     /* one directory entry per image */
+    BMP_HEADER_SIZE = 40        /* BITMAPINFOHEADER, at the start of each
+                                   bitmap image */
+};
+
+/* Bytes in one row of a bitmap's transparency mask: 1 bit per pixel,
+ * rounded up to a multiple of 4 bytes. */
+static size_t bmp_mask_row(int s)
+{
+    return ((size_t)s + 31) / 32 * 4;
+}
+
+/* Bytes needed to store an s x s icon as a bitmap. */
+static size_t bmp_size(int s)
+{
+    return BMP_HEADER_SIZE + (size_t)s * s * 4 + bmp_mask_row(s) * s;
 }
 
 /*
- * Store a w x h RGBA image as an icon bitmap, the uncompressed format
- * that every version of Windows can read. Returns a malloc'd buffer and
- * stores its length in *len. The caller frees it.
+ * Store an s x s RGBA icon as a bitmap at out, which must have room for
+ * bmp_size(s) bytes and must already be zero-filled.
  *
- * An icon bitmap has three parts, one after another:
+ * A bitmap has three parts, one after another:
  *   1. A 40-byte header (BITMAPINFOHEADER) giving the image dimensions and
  *      pixel format.
  *   2. The color pixels, 4 bytes each in the order blue, green, red,
  *      alpha (the reverse of PNG's red, green, blue). Rows are stored
  *      from the bottom row of the picture up to the top row.
  *   3. A transparency mask: 1 bit per pixel, a 1 marking a transparent
- *      pixel, also bottom row first. Windows XP and later use the alpha
- *      bytes instead, but the mask must still be present, and older
- *      versions of Windows that don't understand alpha rely on it. Each
- *      mask row is padded with unused bits to a multiple of 4 bytes.
+ *      pixel, also bottom row first. The format requires it even when the
+ *      pixels have alpha. Each mask row is padded with unused bits to a
+ *      multiple of 4 bytes.
  */
-static unsigned char *encode_bmp(const unsigned char *rgba, int w, int h,
-                                 png_alloc_size_t *len)
+static void write_bmp(unsigned char *out, const unsigned char *rgba, int s)
 {
-    /* Bytes per mask row: w bits, rounded up to a multiple of 32 bits. */
-    size_t mask_row = ((size_t)w + 31) / 32 * 4;
-    size_t color_size = (size_t)w * h * 4;
-    size_t mask_size = mask_row * h;
-    size_t total = 40 + color_size + mask_size;
-
-    /* calloc zero-fills, so header fields not set below are 0, and the
-     * mask starts with every pixel marked opaque. */
-    unsigned char *buf = calloc(total, 1);
-    if (!buf)
-        die("out of memory");
+    size_t mask_row = bmp_mask_row(s);
+    size_t color_size = (size_t)s * s * 4;
 
     /*
      * Header. The height is written as twice the image height: in icon
      * files it counts the color pixels and the mask together. The fields
-     * left at 0 are compression (0 = none), print resolution, and palette
-     * sizes, none of which apply here.
+     * not written here are left at 0: compression (0 = none), print
+     * resolution, and palette sizes, none of which apply.
      */
-    put32(buf, 40);                                /* header size */
-    put32(buf + 4, (unsigned long)w);
-    put32(buf + 8, 2UL * (unsigned long)h);
-    put16(buf + 12, 1);                            /* color planes */
-    put16(buf + 14, 32);                           /* bits per pixel */
-    put32(buf + 20, (unsigned long)(color_size + mask_size));
+    put32(out, BMP_HEADER_SIZE);
+    put32(out + 4, (uint32_t)s);                    /* width */
+    put32(out + 8, 2 * (uint32_t)s);                /* height, doubled */
+    put16(out + 12, 1);                             /* color planes */
+    put16(out + 14, 32);                            /* bits per pixel */
+    put32(out + 20, (uint32_t)(bmp_size(s) - BMP_HEADER_SIZE));
 
-    unsigned char *color = buf + 40;
+    unsigned char *color = out + BMP_HEADER_SIZE;
     unsigned char *mask = color + color_size;
 
-    /* Output row y holds picture row h - 1 - y, so the bottom row is first. */
-    for (int y = 0; y < h; y++) {
-        const unsigned char *src = rgba + (size_t)(h - 1 - y) * w * 4;
-        unsigned char *dst = color + (size_t)y * w * 4;
+    /* Output row y holds picture row s - 1 - y, so the bottom row is first. */
+    for (int y = 0; y < s; y++) {
+        const unsigned char *src = rgba + (size_t)(s - 1 - y) * s * 4;
+        unsigned char *dst = color + (size_t)y * s * 4;
         unsigned char *mrow = mask + (size_t)y * mask_row;
 
-        for (int x = 0; x < w; x++, src += 4, dst += 4) {
+        for (int x = 0; x < s; x++, src += 4, dst += 4) {
             dst[0] = src[2];    /* blue */
             dst[1] = src[1];    /* green */
             dst[2] = src[0];    /* red */
@@ -433,163 +872,231 @@ static unsigned char *encode_bmp(const unsigned char *rgba, int w, int h,
                 mrow[x / 8] |= (unsigned char)(0x80 >> (x % 8));
         }
     }
-
-    *len = total;
-    return buf;
 }
 
-int main(int argc, char **argv)
+/*
+ * PNG encoding uses libpng's png_image_write_to_memory(). Called with a
+ * NULL buffer, it compresses the image only to report how many bytes the
+ * PNG needs; called again with a buffer that large, it writes the PNG.
+ * png_size() makes the first call and write_png() the second. Failure
+ * is reported as -ENOMEM.
+ */
+static size_t png_size(const unsigned char *rgba, int s)
 {
-    static const int defaults[] = { 16, 24, 32, 48, 64, 128, 256 };
+    png_image png;
+    memset(&png, 0, sizeof png);
+    png.version = PNG_IMAGE_VERSION;
+    png.width = (png_uint_32)s;
+    png.height = (png_uint_32)s;
+    png.format = PNG_FORMAT_RGBA;
 
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s out.ico in.png [size ...]\n", argv[0]);
-        return 2;
+    png_alloc_size_t len = 0;
+    if (!png_image_write_to_memory(&png, NULL, &len, 0, rgba, 0, NULL)) {
+        fprintf(stderr, "png2ico: Cannot encode the %dx%d icon: %s.\n",
+                s, s, png.message);
+        exit(-ENOMEM);
+    }
+    return len;
+}
+
+static void write_png(unsigned char *out, size_t len,
+                      const unsigned char *rgba, int s)
+{
+    png_image png;
+    memset(&png, 0, sizeof png);
+    png.version = PNG_IMAGE_VERSION;
+    png.width = (png_uint_32)s;
+    png.height = (png_uint_32)s;
+    png.format = PNG_FORMAT_RGBA;
+
+    png_alloc_size_t written = len;
+    if (!png_image_write_to_memory(&png, out, &written, 0, rgba, 0, NULL)) {
+        fprintf(stderr, "png2ico: Cannot encode the %dx%d icon: %s.\n",
+                s, s, png.message);
+        exit(-ENOMEM);
+    }
+}
+
+/*
+ * Step 3: encode each icon in set and write the .ico file.
+ *
+ * The file's layout is:
+ *   1. A 6-byte header ("ICONDIR").
+ *   2. One 16-byte directory entry ("ICONDIRENTRY") per image, giving that
+ *      image's size, its length in bytes, and its byte offset from the
+ *      start of the file.
+ *   3. The image data itself: each image's bitmap or PNG, back to back.
+ *
+ * The whole file is assembled in one buffer and written with one call.
+ * Sizes below 256 are stored as bitmaps and 256 as PNG; see the top of
+ * this file.
+ */
+static void write_ico(const struct options *opt, const struct image_set *set)
+{
+    /*
+     * First work out each image's length, and from those the length of
+     * the whole file, so that it can be allocated at once. A bitmap's
+     * length follows from its size; a PNG's is only known by compressing
+     * it.
+     */
+    size_t len[NUM_SIZES] = { 0 };
+    size_t file_size = ICONDIR_SIZE;
+    unsigned count = 0;
+
+    for (int slot = 0; slot < NUM_SIZES; slot++) {
+        if (!opt->target[slot])
+            continue;
+        int s = possible_sizes[slot];
+        len[slot] = s == 256 ? png_size(set->icon[slot], s) : bmp_size(s);
+        file_size += ICONDIRENTRY_SIZE + len[slot];
+        count++;
     }
 
-    /*
-     * Collect the requested sizes, or use the defaults. The .ico header
-     * stores the image count in 16 bits, hence the 65535 limit. Sizes are
-     * capped at 256 because each directory entry stores width and height
-     * in a single byte, with 0 meaning 256.
-     */
-    int n = argc > 3 ? argc - 3 : (int)(sizeof defaults / sizeof *defaults);
-    if (n > 0xFFFF)
-        die("too many sizes");
-    int *sizes = malloc(sizeof *sizes * (size_t)n);
-    if (!sizes)
-        die("out of memory");
-    for (int i = 0; i < n; i++) {
-        if (argc > 3) {
-            char *end;
-            long v = strtol(argv[3 + i], &end, 10);
-            if (*end || v < 1 || v > 256)
-                die("sizes must be integers in 1..256");
-            sizes[i] = (int)v;
-        } else {
-            sizes[i] = defaults[i];
-        }
+    /* Zero-filled, as write_bmp() requires. */
+    unsigned char *file = calloc(file_size, 1);
+    if (!file) {
+        fprintf(stderr, "png2ico: Out of memory.\n");
+        exit(-ENOMEM);
     }
-
-    /*
-     * Read the source PNG using libpng's "simplified" API, which handles
-     * file I/O and pixel-format conversion internally.
-     *
-     * png_image_begin_read_from_file() opens the file with fopen() and
-     * reads the header, which fills in the image width and height. We
-     * then ask for 8-bit RGBA output, whatever the file's actual format
-     * (palette, grayscale, 16-bit, etc.), and png_image_finish_read()
-     * decodes the pixels into our buffer and closes the file.
-     *
-     * If either call fails, libpng closes the file and frees its own
-     * state before returning, so the error paths need no cleanup. The one
-     * exception is our own malloc failing between the two calls, where we
-     * must call png_image_free() ourselves to close the file.
-     */
-    png_image src;
-    memset(&src, 0, sizeof src);
-    src.version = PNG_IMAGE_VERSION;
-    if (!png_image_begin_read_from_file(&src, argv[2]))
-        die(src.message);
-    src.format = PNG_FORMAT_RGBA;
-    unsigned char *pixels = malloc(PNG_IMAGE_SIZE(src));
-    if (!pixels) {
-        png_image_free(&src);
-        die("out of memory");
-    }
-    if (!png_image_finish_read(&src, NULL, pixels, 0, NULL))
-        die(src.message);
-
-    /*
-     * Build every icon image up front. Each one is scaled, then stored as
-     * a bitmap, or as a PNG for the 256 size (see the top of this file).
-     * The stored lengths must be known before anything is written,
-     * because the file's directory records where each image begins.
-     */
-    unsigned char **blobs = malloc(sizeof *blobs * (size_t)n);
-    png_alloc_size_t *lens = malloc(sizeof *lens * (size_t)n);
-    if (!blobs || !lens)
-        die("out of memory");
-    for (int i = 0; i < n; i++) {
-        int s = sizes[i];
-        unsigned char *px = render(pixels, (int)src.width,
-                                   (int)src.height, s);
-        blobs[i] = s == 256 ? encode_png(px, s, s, &lens[i])
-                            : encode_bmp(px, s, s, &lens[i]);
-        free(px);
-    }
-    free(pixels);
-
-    /*
-     * Write the .ico file. Its layout is:
-     *
-     *   1. A 6-byte header ("ICONDIR").
-     *   2. One 16-byte directory entry ("ICONDIRENTRY") per image, giving
-     *      that image's size, its length in bytes, and its byte offset from
-     *      the start of the file.
-     *   3. The image data itself: each image's bitmap or PNG, back to back.
-     */
-    FILE *f = fopen(argv[1], "wb");
-    if (!f)
-        die("cannot open output file");
 
     /* Header: reserved (must be 0), file type (1 = icon, 2 = cursor), and
      * number of images. */
-    unsigned char hdr[6];
-    put16(hdr, 0);
-    put16(hdr + 2, 1);
-    put16(hdr + 4, (unsigned)n);
-    fwrite(hdr, 1, sizeof hdr, f);
+    put16(file, 0);
+    put16(file + 2, 1);
+    put16(file + 4, (uint16_t)count);
 
     /* The first image starts right after the header and all directory
      * entries. Each later image starts where the previous one ended. */
-    unsigned long off = 6 + 16UL * (unsigned long)n;
-    for (int i = 0; i < n; i++) {
-        unsigned char e[16];
+    unsigned char *entry = file + ICONDIR_SIZE;
+    size_t offset = ICONDIR_SIZE + (size_t)count * ICONDIRENTRY_SIZE;
 
-        /* Width and height in one byte each. 256 doesn't fit, so the
-         * format uses 0 to mean 256; masking with 0xFF produces that. */
-        e[0] = (unsigned char)(sizes[i] & 0xFF);
-        e[1] = (unsigned char)(sizes[i] & 0xFF);
+    for (int slot = 0; slot < NUM_SIZES; slot++) {
+        if (!opt->target[slot])
+            continue;
+        int s = possible_sizes[slot];
 
-        /* Number of palette colors: 0, since these are not palette images. */
-        e[2] = 0;
+        /* Width and height in one byte each. 256 doesn't fit in a byte,
+         * so the format uses 0 to mean 256. */
+        entry[0] = s == 256 ? 0 : (unsigned char)s;
+        entry[1] = s == 256 ? 0 : (unsigned char)s;
 
-        /* Reserved; must be 0. */
-        e[3] = 0;
+        /* entry[2], the number of palette colors, and entry[3], reserved,
+         * stay 0. */
 
         /*
          * Color planes: always 1. Bits per pixel: 32, meaning 8 bits each
          * for red, green, blue and alpha.
          */
-        put16(e + 4, 1);
-        put16(e + 6, 32);
+        put16(entry + 4, 1);
+        put16(entry + 6, 32);
 
         /* Length of this image's data, then where in the file it starts. */
-        put32(e + 8, (unsigned long)lens[i]);
-        put32(e + 12, off);
+        put32(entry + 8, (uint32_t)len[slot]);
+        put32(entry + 12, (uint32_t)offset);
 
-        fwrite(e, 1, sizeof e, f);
-        off += (unsigned long)lens[i];
-    }
+        if (s == 256)
+            write_png(file + offset, len[slot], set->icon[slot], s);
+        else
+            write_bmp(file + offset, set->icon[slot], s);
 
-    /* The image data, in the same order as the directory entries. */
-    for (int i = 0; i < n; i++) {
-        fwrite(blobs[i], 1, lens[i], f);
-        free(blobs[i]);
+        offset += len[slot];
+        entry += ICONDIRENTRY_SIZE;
     }
-    free(blobs);
-    free(lens);
-    free(sizes);
 
     /*
-     * fwrite() is buffered, so a write error may only show up later.
-     * ferror() reports any error from the writes so far, and fclose()
-     * flushes the remaining buffered data and reports any error from that.
-     * Both are checked; the bitwise | makes sure fclose() is always
-     * called, even if ferror() already reported a failure.
+     * Write to a temporary file in the same directory, then rename it to
+     * OUTPUT. On any failure, delete the temporary file. Each errno is
+     * saved before calling remove(), which may change it; EIO stands in if
+     * a call failed without setting errno.
      */
-    if (ferror(f) | fclose(f))
-        die("write failed");
-    return 0;
+    /*
+     * The temporary file's name is OUTPUT.PID.N. The process ID keeps it
+     * distinct from any other run's; N counts up from 0 if a file of that
+     * name already exists, such as one left behind by a crashed run.
+     * O_EXCL makes open() fail with EEXIST rather than reuse an existing
+     * file. The kernel applies the umask to the 0666 mode, giving the same
+     * permissions fopen() would.
+     */
+    size_t tmp_size = strlen(opt->output) + 48;    /* room for ".PID.N" */
+    char *tmp = malloc(tmp_size);
+    if (!tmp) {
+        fprintf(stderr, "png2ico: Out of memory.\n");
+        exit(-ENOMEM);
+    }
+
+    int fd;
+    for (unsigned attempt = 0; ; attempt++) {
+        snprintf(tmp, tmp_size, "%s.%ld.%u", opt->output, (long)getpid(), attempt);
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd >= 0)
+            break;
+        if (errno != EEXIST || attempt == 99) {
+            int err = errno ? errno : EIO;
+            fprintf(stderr, "png2ico: Cannot create \"%s\": %s.\n",
+                    tmp, strerror(err));
+            exit(-err);
+        }
+    }
+
+    FILE *f = fdopen(fd, "wb");
+    if (!f) {
+        int err = errno ? errno : EIO;
+        close(fd);
+        remove(tmp);
+        fprintf(stderr, "png2ico: Cannot write \"%s\": %s.\n",
+                tmp, strerror(err));
+        exit(-err);
+    }
+
+    if (fwrite(file, 1, file_size, f) != file_size) {
+        int err = errno ? errno : EIO;
+        fclose(f);
+        remove(tmp);
+        fprintf(stderr, "png2ico: Cannot write \"%s\": %s.\n",
+                tmp, strerror(err));
+        exit(-err);
+    }
+
+    /* fwrite() is buffered; fclose() writes the rest and reports whether
+     * that succeeded. */
+    if (fclose(f) != 0) {
+        int err = errno ? errno : EIO;
+        remove(tmp);
+        fprintf(stderr, "png2ico: Cannot write \"%s\": %s.\n",
+                tmp, strerror(err));
+        exit(-err);
+    }
+
+    if (rename(tmp, opt->output) != 0) {
+        int err = errno ? errno : EIO;
+        remove(tmp);
+        fprintf(stderr, "png2ico: Cannot rename \"%s\" to \"%s\": %s.\n",
+                tmp, opt->output, strerror(err));
+        exit(-err);
+    }
+
+    free(tmp);
+    free(file);
+}
+
+/* Step 4: free everything allocated by the earlier steps. */
+static void cleanup(struct options *opt, struct image_set *set)
+{
+    for (int i = 0; i < opt->num_inputs; i++)
+        free(set->input[i].rgba);
+    free(set->input);
+    free(set->icon_block);
+    free(opt->inputs);
+}
+
+int main(int argc, char **argv)
+{
+    struct options opt;
+    struct image_set set;
+
+    parse_command_line(&opt, argc, argv);
+    read_sources(&opt, &set);
+    write_ico(&opt, &set);
+    cleanup(&opt, &set);
+    return EXIT_SUCCESS;
 }
